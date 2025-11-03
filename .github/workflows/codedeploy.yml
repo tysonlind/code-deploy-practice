@@ -2,85 +2,94 @@ name: Deploy to AWS CodeDeploy
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
 
 jobs:
   deploy:
     name: Package and deploy
     runs-on: ubuntu-latest
     environment: dev
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Configure AWS (us-east-2 for your stack)
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-region: ${{ vars.AWS_REGION }} # set to us-east-2
+          mask-aws-account-id: true
 
+      # Optional: bundle metadata (safe to keep in the zip; just don't reference it in appspec files:)
       - name: Create deploy metadata
         run: |
           cat > deploy-info.json <<JSON
           {
             "repository": "${GITHUB_REPOSITORY}",
-            "commit": "${GITHUB_SHA}"
+            "commit": "${GITHUB_SHA}",
+            "run_id": "${GITHUB_RUN_ID}"
           }
           JSON
 
+      # Make sure hook scripts are executable in the bundle
+      - name: Ensure hook scripts are executable
+        run: |
+          if [ -d scripts ]; then
+            chmod +x scripts/* || true
+          fi
+
       - name: Package artifact
         run: |
-          TIMESTAMP=$(date +%Y%m%d%H%M%S)
-          ARTIFACT_NAME=app-${TIMESTAMP}.zip
-          # Exclude VCS and workflow files
-          zip -r "$ARTIFACT_NAME" . -x ".git/*" "./.github/*"
-          echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> $GITHUB_ENV
+          set -euo pipefail
+          TS=$(date +%Y%m%d%H%M%S)
+          SHORT_SHA=${GITHUB_SHA::7}
+          ARTIFACT_NAME="app-${TS}-${SHORT_SHA}.zip"
+
+          # Package only what we need; exclude VCS/workflow noise
+          zip -r "$ARTIFACT_NAME" . \
+            -x ".git/*" ".github/*" ".gitignore"
+
+          echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> "$GITHUB_ENV"
 
       - name: Upload artifact to S3
         env:
           S3_BUCKET: ${{ vars.S3_BUCKET }}
           S3_PREFIX: ${{ vars.S3_PREFIX }}
         run: |
-          if [ -z "$S3_BUCKET" ]; then
-            echo "S3_BUCKET secret not set; aborting upload" >&2
-            exit 1
-          fi
-          # Normalize optional prefix (strip leading/trailing slashes); build S3 key
-          if [ -n "$S3_PREFIX" ]; then
+          set -euo pipefail
+          : "${S3_BUCKET:?S3_BUCKET var must be set}"
+          # Normalize optional prefix (strip leading/trailing slashes)
+          if [ -n "${S3_PREFIX:-}" ]; then
             S3_PREFIX="${S3_PREFIX#/}"
             S3_PREFIX="${S3_PREFIX%/}"
             S3_KEY="${S3_PREFIX}/${ARTIFACT_NAME}"
           else
             S3_KEY="${ARTIFACT_NAME}"
           fi
-          echo "Using S3 key: $S3_KEY"
+          echo "Uploading to s3://$S3_BUCKET/$S3_KEY"
           aws s3 cp "$ARTIFACT_NAME" "s3://$S3_BUCKET/$S3_KEY"
-          echo "S3_KEY=$S3_KEY" >> $GITHUB_ENV
+          echo "S3_KEY=$S3_KEY" >> "$GITHUB_ENV"
 
       - name: Register S3 revision with CodeDeploy
         env:
-          APPLICATION_NAME: ${{ vars.CODEDEPLOY_APPLICATION }}
-          DEPLOYMENT_GROUP: ${{ vars.CODEDEPLOY_DEPLOYMENT_GROUP }}
-          S3_BUCKET: ${{ vars.S3_BUCKET }}
+          APPLICATION_NAME: ${{ vars.CODEDEPLOY_APPLICATION }}       # e.g., CodeDeployPractice
+          DEPLOYMENT_GROUP:  ${{ vars.CODEDEPLOY_DEPLOYMENT_GROUP }}  # e.g., CodeDeployPractice-Grp
+          S3_BUCKET:         ${{ vars.S3_BUCKET }}
+          S3_KEY:            ${{ env.S3_KEY }}
         run: |
-          cat > revision.json <<JSON
-          {
-            "revisionType": "S3",
-            "s3Location": {
-              "bucket": "${S3_BUCKET}",
-              "key": "${S3_KEY}",
-              "bundleType": "zip"
-            }
-          }
-          JSON
-          DEPLOYMENT_ID=$(aws deploy create-deployment \
-            --application-name "$APPLICATION_NAME" \
-            --deployment-group-name "$DEPLOYMENT_GROUP" \
-            --revision file://revision.json \
-            --query deploymentId --output text)
+          set -euo pipefail
+          DEPLOYMENT_ID=$(
+            aws deploy create-deployment \
+              --application-name "$APPLICATION_NAME" \
+              --deployment-group-name "$DEPLOYMENT_GROUP" \
+              --s3-location bucket="$S3_BUCKET",key="$S3_KEY",bundleType=zip \
+              --query deploymentId --output text
+          )
           echo "Created deployment: $DEPLOYMENT_ID"
-          echo "DEPLOYMENT_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
+          echo "DEPLOYMENT_ID=$DEPLOYMENT_ID" >> "$GITHUB_ENV"
 
       - name: Wait for deployment to finish
         env:
@@ -90,24 +99,33 @@ jobs:
           MAX_SECONDS=$((10 * 60)) # 10 minutes
           SLEEP=5
           ELAPSED=0
-          while true; do
+
+          while :; do
             STATUS=$(aws deploy get-deployment --deployment-id "$DEPLOYMENT_ID" --query 'deploymentInfo.status' --output text)
             echo "Deployment status: $STATUS"
+
             if [[ "$STATUS" == "Succeeded" ]]; then
               echo "Deployment succeeded"
               exit 0
             fi
-            if [[ "$STATUS" == "Failed" ]] || [[ "$STATUS" == "Stopped" ]]; then
-              echo "Deployment failed or stopped"
+
+            if [[ "$STATUS" == "Failed" || "$STATUS" == "Stopped" ]]; then
+              echo "Deployment failed or stopped. Fetching details..."
+              aws deploy get-deployment \
+                --deployment-id "$DEPLOYMENT_ID" \
+                --query 'deploymentInfo.{status:status,err:ErrorInformation,message:description}' \
+                --output table || true
               exit 1
             fi
+
             if [[ $ELAPSED -ge $MAX_SECONDS ]]; then
-              echo "Timed out waiting for deployment (waited $ELAPSED seconds)"
+              echo "Timed out waiting for deployment (waited ${ELAPSED}s)"
               exit 1
             fi
-            sleep $SLEEP
+
+            sleep "$SLEEP"
             ELAPSED=$((ELAPSED + SLEEP))
-            # simple backoff - increase sleep up to 30s
+            # backoff up to 30s
             if [[ $SLEEP -lt 30 ]]; then
               SLEEP=$((SLEEP * 2))
               if [[ $SLEEP -gt 30 ]]; then SLEEP=30; fi
